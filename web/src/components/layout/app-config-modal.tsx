@@ -36,6 +36,7 @@ const modelGroups: ModelGroup[] = [
 
 const apiFormatOptions: Array<{ label: string; value: ApiCallFormat }> = [
     { label: "OpenAI", value: "openai" },
+    { label: "NewAPI", value: "newapi" },
     { label: "Gemini", value: "gemini" },
 ];
 
@@ -478,7 +479,9 @@ function uniqueModels(models: string[]) {
 }
 
 function apiFormatLabel(apiFormat: ApiCallFormat) {
-    return apiFormat === "gemini" ? "Gemini" : "OpenAI";
+    if (apiFormat === "gemini") return "Gemini";
+    if (apiFormat === "newapi") return "NewAPI";
+    return "OpenAI";
 }
 
 function formatWebdavTime(value: string) {
