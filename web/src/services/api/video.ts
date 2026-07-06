@@ -11,10 +11,22 @@ import type { ReferenceAudio, ReferenceVideo } from "@/types/media";
 type OpenAiVideoTask = { id: string; status?: string; error?: { message?: string } };
 type NewApiVideoTask = {
     task_id?: string;
-    status?: "queued" | "in_progress" | "completed" | "failed" | string;
+    id?: number | string;
+    status?: string;
+    progress?: string;
+    fail_reason?: string;
+    result_url?: string;
     url?: string;
-    format?: string;
-    metadata?: Record<string, unknown>;
+    video_url?: string;
+    // 兼容未拆信封时 data 里同样携带这些字段，以及嵌套 output
+    data?: {
+        status?: string;
+        fail_reason?: string;
+        result_url?: string;
+        url?: string;
+        video_url?: string;
+        output?: { video_url?: string; task_status?: string };
+    } | null;
     error?: { message?: string; code?: string } | string | null;
 };
 type SeedanceTask = {
@@ -132,11 +144,11 @@ async function createNewApiVideoTask(config: AiConfig, model: string, prompt: st
         }
     }
     if (references.length) {
-        const dataUrl = await imageToDataUrl(references[0]);
-        if (dataUrl) payload.image = dataUrl;
+        const dataUrls = (await Promise.all(references.map((image) => imageToDataUrl(image)))).filter(Boolean);
+        if (dataUrls.length) payload.images = dataUrls;
     }
     try {
-        const created = unwrapNewApiVideoTask((await axios.post<ApiEnvelope<NewApiVideoTask>>(aiApiUrl(config, "/video/generations"), payload, { headers: aiHeaders(config, "application/json"), signal: options?.signal })).data);
+        const created = unwrapNewApiVideoTask((await axios.post<unknown>(aiApiUrl(config, "/video/generations"), payload, { headers: aiHeaders(config, "application/json"), signal: options?.signal })).data);
         if (!created.task_id) throw new Error("视频接口没有返回任务 ID");
         return { id: created.task_id, provider: "newapi", model };
     } catch (error) {
@@ -146,17 +158,33 @@ async function createNewApiVideoTask(config: AiConfig, model: string, prompt: st
 
 async function pollNewApiVideoTask(config: AiConfig, task: VideoGenerationTask, options?: RequestOptions): Promise<VideoGenerationTaskState> {
     try {
-        const state = unwrapNewApiVideoTask((await axios.get<ApiEnvelope<NewApiVideoTask>>(aiApiUrl(config, `/video/generations/${task.id}`), { headers: aiHeaders(config), signal: options?.signal })).data);
-        if (state.status === "completed") {
-            const url = state.url;
+        const state = unwrapNewApiVideoTask((await axios.get<unknown>(aiApiUrl(config, `/video/generations/${task.id}`), { headers: aiHeaders(config), signal: options?.signal })).data);
+        const status = normalizeNewApiVideoStatus(readNewApiVideoStatus(state));
+        if (status === "completed") {
+            const url = readNewApiVideoUrl(state);
             if (!url) return { status: "failed", error: "视频任务成功但没有返回视频 URL" };
-            return { status: "completed", result: await videoResultFromUrl(url, options) };
+            return { status: "completed", result: { url, mimeType: "video/mp4" } };
         }
-        if (state.status === "failed") return { status: "failed", error: readVideoTaskError(state.error) || "视频生成失败" };
+        if (status === "failed") return { status: "failed", error: readVideoTaskError(state.error) || state.fail_reason || state.data?.fail_reason || "视频生成失败" };
         return { status: "pending" };
     } catch (error) {
         throw new Error(readAxiosError(error, "视频任务查询失败"));
     }
+}
+
+function normalizeNewApiVideoStatus(status: string | undefined) {
+    const value = (status || "").trim().toLowerCase();
+    if (["completed", "success", "succeeded", "succeed", "done", "finished"].includes(value)) return "completed";
+    if (["failed", "fail", "error", "cancelled", "canceled", "expired"].includes(value)) return "failed";
+    return "pending";
+}
+
+function readNewApiVideoStatus(state: NewApiVideoTask): string {
+    return state.status || state.data?.status || state.data?.output?.task_status || "";
+}
+
+function readNewApiVideoUrl(state: NewApiVideoTask): string {
+    return state.result_url || state.url || state.video_url || state.data?.result_url || state.data?.url || state.data?.video_url || state.data?.output?.video_url || "";
 }
 
 function readVideoTaskError(error: NewApiVideoTask["error"]) {
@@ -316,8 +344,30 @@ function unwrapOpenAiVideoTask(payload: ApiEnvelope<OpenAiVideoTask>) {
     return unwrapEnvelope(payload, "接口没有返回视频任务");
 }
 
-function unwrapNewApiVideoTask(payload: ApiEnvelope<NewApiVideoTask>) {
-    return unwrapEnvelope(payload, "接口没有返回视频任务");
+function unwrapNewApiVideoTask(payload: unknown): NewApiVideoTask {
+    if (!payload || typeof payload !== "object") throw new Error("接口没有返回视频任务");
+    const env = payload as Record<string, unknown>;
+    // NewAPI 字符串 code 信封：{ code: "success"|"failed", message, data }
+    if (typeof env.code === "string") {
+        if (env.code.toLowerCase() !== "success") {
+            const message = typeof env.message === "string" ? env.message : typeof env.msg === "string" ? env.msg : "";
+            throw new Error(message || "请求失败");
+        }
+        const data = env.data;
+        if (!data || typeof data !== "object") throw new Error("接口没有返回视频任务");
+        return data as NewApiVideoTask;
+    }
+    // 数字 code 信封：{ code: 0|非0, msg, data }
+    if (typeof env.code === "number") {
+        if (env.code !== 0) {
+            const message = typeof env.msg === "string" ? env.msg : typeof env.message === "string" ? env.message : "";
+            throw new Error(message || "请求失败");
+        }
+        const data = env.data;
+        if (!data || typeof data !== "object") throw new Error("接口没有返回视频任务");
+        return data as NewApiVideoTask;
+    }
+    return payload as NewApiVideoTask;
 }
 
 function unwrapSeedanceTask(payload: ApiEnvelope<SeedanceTask>) {
