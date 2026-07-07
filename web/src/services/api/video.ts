@@ -230,22 +230,79 @@ function normalizeBailianDuration(value: string) {
     return Math.max(2, Math.min(15, seconds));
 }
 
-async function createBailianVideoTask(config: AiConfig, model: string, prompt: string, references: ReferenceImage[], options?: RequestOptions): Promise<VideoGenerationTask> {
-    const input: Record<string, unknown> = { prompt };
-    if (references.length) {
-        const dataUrl = await imageToDataUrl(references[0]);
-        if (dataUrl) input.media = [{ type: "first_frame", url: dataUrl }];
+function isBailianKlingModel(model: string) {
+    return modelOptionName(model).toLowerCase().includes("kling");
+}
+
+function isBailianKlingOmniModel(model: string) {
+    const value = modelOptionName(model).toLowerCase();
+    return value.includes("kling") && value.includes("omni");
+}
+
+function bailianKlingMode(vquality: string) {
+    return vquality === "1080" ? "pro" : "std";
+}
+
+function bailianKlingAspectRatio(size: string) {
+    const normalized = normalizeVideoSize(size);
+    if (!normalized) return "16:9";
+    const [width, height] = normalized.split("x").map(Number);
+    if (width === height) return "1:1";
+    return width > height ? "16:9" : "9:16";
+}
+
+function normalizeBailianKlingDuration(value: string) {
+    const seconds = Math.floor(Number(value) || 5);
+    return Math.max(3, Math.min(15, seconds));
+}
+
+async function buildBailianMedia(model: string, mode: string, references: ReferenceImage[]): Promise<Array<{ type: string; url: string }>> {
+    if (!references.length) return [];
+    const resolvedMode = mode || "auto";
+    let effective = resolvedMode;
+    if (effective === "auto") {
+        effective = references.length === 1 ? "first_frame" : references.length === 2 ? "first_last" : "refer";
     }
-    const payload = {
-        model: modelOptionName(model),
-        input,
-        parameters: {
-            resolution: normalizeBailianResolution(config.vquality),
-            duration: normalizeBailianDuration(config.videoSeconds),
-            prompt_extend: true,
-            watermark: boolConfig(config.videoWatermark, false),
-        },
-    };
+    if (effective === "refer") {
+        if (!isBailianKlingOmniModel(model)) {
+            throw new Error("参考生视频仅支持 kling/kling-v3-omni-video-generation 模型，请切换模型或减少到 2 张以使用首尾帧");
+        }
+        const dataUrls = (await Promise.all(references.map((image) => imageToDataUrl(image)))).filter(Boolean);
+        return dataUrls.map((url) => ({ type: "refer", url }));
+    }
+    if (effective === "first_last" && references.length >= 2) {
+        const first = await imageToDataUrl(references[0]);
+        const last = await imageToDataUrl(references[1]);
+        const media: Array<{ type: string; url: string }> = [];
+        if (first) media.push({ type: "first_frame", url: first });
+        if (last) media.push({ type: "last_frame", url: last });
+        return media;
+    }
+    const url = await imageToDataUrl(references[0]);
+    return url ? [{ type: "first_frame", url }] : [];
+}
+
+async function createBailianVideoTask(config: AiConfig, model: string, prompt: string, references: ReferenceImage[], options?: RequestOptions): Promise<VideoGenerationTask> {
+    const modelName = modelOptionName(model);
+    const media = await buildBailianMedia(modelName, config.videoImageMode, references);
+    const input: Record<string, unknown> = { prompt };
+    if (media.length) input.media = media;
+    const isKling = isBailianKlingModel(modelName);
+    const parameters = isKling
+        ? {
+              mode: bailianKlingMode(config.vquality),
+              aspect_ratio: bailianKlingAspectRatio(config.size),
+              duration: normalizeBailianKlingDuration(config.videoSeconds),
+              audio: boolConfig(config.videoGenerateAudio, false),
+              watermark: boolConfig(config.videoWatermark, false),
+          }
+        : {
+              resolution: normalizeBailianResolution(config.vquality),
+              duration: normalizeBailianDuration(config.videoSeconds),
+              prompt_extend: true,
+              watermark: boolConfig(config.videoWatermark, false),
+          };
+    const payload = { model: modelName, input, parameters };
     try {
         const response = await axios.post<{ output?: BailianVideoTask; code?: string; message?: string }>(
             bailianVideoApiUrl(config, "/api/v1/services/aigc/video-generation/video-synthesis"),

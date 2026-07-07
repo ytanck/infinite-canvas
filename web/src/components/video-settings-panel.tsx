@@ -4,7 +4,7 @@ import { Switch } from "antd";
 import { ImageSettingsTheme } from "@/components/image-settings-panel";
 import { boolConfig, isSeedanceFastModel, isSeedanceVideoConfig, normalizeSeedanceDuration, normalizeSeedanceRatio, normalizeSeedanceResolution, seedanceDurationOptions, seedancePixelLabel, seedanceRatioOptions, seedanceResolutionOptions } from "@/lib/seedance-video";
 import { type CanvasTheme } from "@/lib/canvas-theme";
-import { modelOptionName, type AiConfig } from "@/stores/use-config-store";
+import { modelOptionName, resolveModelRequestConfig, type AiConfig } from "@/stores/use-config-store";
 
 const resolutionOptions = [
     { value: "720", label: "720p" },
@@ -22,9 +22,16 @@ const sizeOptions = [
 
 const secondOptions = [6, 10, 12, 16, 20];
 
+const bailianImageModeOptions = [
+    { value: "auto", label: "自动" },
+    { value: "first_frame", label: "首帧" },
+    { value: "first_last", label: "首尾帧" },
+    { value: "refer", label: "参考生视频" },
+];
+
 type VideoSettingsPanelProps = {
     config: AiConfig;
-    onConfigChange: (key: "vquality" | "size" | "videoSeconds" | "videoGenerateAudio" | "videoWatermark", value: string) => void;
+    onConfigChange: (key: "vquality" | "size" | "videoSeconds" | "videoGenerateAudio" | "videoWatermark" | "videoImageMode", value: string) => void;
     theme: CanvasTheme;
     showTitle?: boolean;
     className?: string;
@@ -39,6 +46,7 @@ export function VideoSettingsPanel({ config, onConfigChange, theme, showTitle = 
     const size = normalizeVideoSizeValue(config.size);
     const dimensions = readSizeDimensions(size);
     const resolution = normalizeVideoResolutionValue(config.vquality);
+    const videoApiFormat = resolveModelRequestConfig(config, config.videoModel || config.model).apiFormat;
     const updateDimension = (key: "width" | "height", value: number | null) => {
         const next = Math.max(1, Math.floor(value || dimensions[key] || 720));
         onConfigChange("size", `${key === "width" ? next : dimensions.width}x${key === "height" ? next : dimensions.height}`);
@@ -95,6 +103,27 @@ export function VideoSettingsPanel({ config, onConfigChange, theme, showTitle = 
                         <NumberInput value={seconds} min={1} max={20} theme={theme} onChange={(value) => onConfigChange("videoSeconds", value)} />
                     </div>
                 </SettingGroup>
+                {videoApiFormat === "bailian" ? (
+                    <>
+                        <SettingGroup title="参考图模式" color={theme.node.muted}>
+                            <div className="grid grid-cols-2 gap-2.5">
+                                {bailianImageModeOptions.map((item) => (
+                                    <OptionPill key={item.value} selected={(config.videoImageMode || "auto") === item.value} theme={theme} onClick={() => onConfigChange("videoImageMode", item.value)}>
+                                        {item.label}
+                                    </OptionPill>
+                                ))}
+                            </div>
+                            <div className="text-[11px] leading-4 opacity-55">自动按数量：1 张首帧、2 张首尾帧、3 张以上参考生视频（参考生视频需 kling-omni 模型）。</div>
+                        </SettingGroup>
+                        <SettingGroup title="输出" color={theme.node.muted}>
+                            <div className="grid gap-2 rounded-xl border p-2.5" style={{ borderColor: theme.node.stroke }}>
+                                <SwitchRow label="生成声音" checked={boolConfig(config.videoGenerateAudio, false)} theme={theme} onChange={(checked) => onConfigChange("videoGenerateAudio", String(checked))} />
+                                <SwitchRow label="添加水印" checked={boolConfig(config.videoWatermark, false)} theme={theme} onChange={(checked) => onConfigChange("videoWatermark", String(checked))} />
+                            </div>
+                            <div className="text-[11px] leading-4 opacity-55">生成声音仅 kling 系列模型生效（wan 系列忽略）。</div>
+                        </SettingGroup>
+                    </>
+                ) : null}
             </div>
         </ImageSettingsTheme>
     );
