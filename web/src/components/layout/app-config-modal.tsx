@@ -35,6 +35,7 @@ const modelGroups: ModelGroup[] = [
 const apiFormatOptions: Array<{ label: string; value: ApiCallFormat }> = [
     { label: "OpenAI", value: "openai" },
     { label: "NewAPI", value: "newapi" },
+    { label: "百炼", value: "bailian" },
     { label: "Gemini", value: "gemini" },
 ];
 
@@ -468,6 +469,7 @@ function uniqueModels(models: string[]) {
 function apiFormatLabel(apiFormat: ApiCallFormat) {
     if (apiFormat === "gemini") return "Gemini";
     if (apiFormat === "newapi") return "NewAPI";
+    if (apiFormat === "bailian") return "百炼";
     return "OpenAI";
 }
 

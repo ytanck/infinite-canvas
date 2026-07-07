@@ -39,7 +39,7 @@ type ApiEnvelope<T> = T | { code?: number; data?: T | null; msg?: string };
 type RequestOptions = { signal?: AbortSignal };
 
 export type VideoGenerationResult = { blob?: Blob; url?: string; mimeType?: string };
-export type VideoGenerationTask = { id: string; provider: "openai" | "newapi" | "seedance"; model: string };
+export type VideoGenerationTask = { id: string; provider: "openai" | "newapi" | "bailian" | "seedance"; model: string };
 export type VideoGenerationTaskState = { status: "pending" } | { status: "completed"; result: VideoGenerationResult } | { status: "failed"; error: string };
 
 function aiApiUrl(config: AiConfig, path: string) {
@@ -55,7 +55,7 @@ function aiHeaders(config: AiConfig, contentType?: string) {
 
 export async function requestVideoGeneration(config: AiConfig, prompt: string, references: ReferenceImage[] = [], videoReferences: ReferenceVideo[] = [], audioReferences: ReferenceAudio[] = [], options?: RequestOptions): Promise<VideoGenerationResult> {
     const task = await createVideoGenerationTask(config, prompt, references, videoReferences, audioReferences, options);
-    const delayMs = task.provider === "seedance" ? 5000 : 2500;
+    const delayMs = task.provider === "seedance" ? 5000 : task.provider === "bailian" ? 15000 : 2500;
     for (let attempt = 0; attempt < 120; attempt += 1) {
         if (options?.signal?.aborted) throw new DOMException("Aborted", "AbortError");
         const state = await pollVideoGenerationTask(config, task, options);
@@ -77,6 +77,9 @@ export async function createVideoGenerationTask(config: AiConfig, prompt: string
     if (videoReferences.length || audioReferences.length) {
         throw new Error("当前视频接口不支持参考视频或参考音频，请切换到 Seedance 2.0 / 火山 Agent Plan 模型，或移除参考素材");
     }
+    if (requestConfig.apiFormat === "bailian") {
+        return createBailianVideoTask(requestConfig, selectedModel, prompt, references, options);
+    }
     if (requestConfig.apiFormat === "newapi") {
         return createNewApiVideoTask(requestConfig, selectedModel, prompt, references, options);
     }
@@ -87,6 +90,7 @@ export async function pollVideoGenerationTask(config: AiConfig, task: VideoGener
     const requestConfig = resolveModelRequestConfig(config, task.model);
     assertVideoConfig(requestConfig, requestConfig.model);
     if (task.provider === "seedance") return pollSeedanceTask(requestConfig, task, options);
+    if (task.provider === "bailian") return pollBailianVideoTask(requestConfig, task, options);
     if (task.provider === "newapi") return pollNewApiVideoTask(requestConfig, task, options);
     return pollOpenAIVideoTask(requestConfig, task, options);
 }
@@ -191,6 +195,93 @@ function readVideoTaskError(error: NewApiVideoTask["error"]) {
     if (!error) return "";
     if (typeof error === "string") return error;
     return error.message || error.code || "";
+}
+
+type BailianVideoTask = {
+    task_id?: string;
+    task_status?: string;
+    video_url?: string;
+    code?: string;
+    message?: string;
+};
+
+function bailianVideoApiUrl(config: AiConfig, path: string) {
+    return `${config.baseUrl.trim().replace(/\/+$/, "")}${path}`;
+}
+
+function bailianVideoHeaders(config: AiConfig, asyncMode = false) {
+    return {
+        Authorization: `Bearer ${config.apiKey}`,
+        "Content-Type": "application/json",
+        ...(asyncMode ? { "X-DashScope-Async": "enable" } : {}),
+    };
+}
+
+function normalizeBailianResolution(value: string) {
+    const resolved = value.replace(/p$/i, "") || "1080";
+    if (resolved === "low" || resolved === "480") return "720P";
+    if (resolved === "auto" || resolved === "high" || resolved === "medium" || resolved === "720") return "720P";
+    if (resolved === "1080") return "1080P";
+    return ["480", "720", "1080"].includes(resolved) ? `${resolved}P` : "1080P";
+}
+
+function normalizeBailianDuration(value: string) {
+    const seconds = Math.floor(Number(value) || 5);
+    return Math.max(2, Math.min(15, seconds));
+}
+
+async function createBailianVideoTask(config: AiConfig, model: string, prompt: string, references: ReferenceImage[], options?: RequestOptions): Promise<VideoGenerationTask> {
+    const input: Record<string, unknown> = { prompt };
+    if (references.length) {
+        const dataUrl = await imageToDataUrl(references[0]);
+        if (dataUrl) input.media = [{ type: "first_frame", url: dataUrl }];
+    }
+    const payload = {
+        model: modelOptionName(model),
+        input,
+        parameters: {
+            resolution: normalizeBailianResolution(config.vquality),
+            duration: normalizeBailianDuration(config.videoSeconds),
+            prompt_extend: true,
+            watermark: boolConfig(config.videoWatermark, false),
+        },
+    };
+    try {
+        const response = await axios.post<{ output?: BailianVideoTask; code?: string; message?: string }>(
+            bailianVideoApiUrl(config, "/api/v1/services/aigc/video-generation/video-synthesis"),
+            payload,
+            { headers: bailianVideoHeaders(config, true), signal: options?.signal },
+        );
+        if (response.data.code && response.data.code !== "") throw new Error(response.data.message || "视频任务创建失败");
+        const taskId = response.data.output?.task_id;
+        if (!taskId) throw new Error("百炼视频接口没有返回任务 ID");
+        return { id: taskId, provider: "bailian", model };
+    } catch (error) {
+        throw new Error(readAxiosError(error, "视频任务创建失败"));
+    }
+}
+
+async function pollBailianVideoTask(config: AiConfig, task: VideoGenerationTask, options?: RequestOptions): Promise<VideoGenerationTaskState> {
+    try {
+        const response = await axios.get<{ output?: BailianVideoTask; code?: string; message?: string }>(
+            bailianVideoApiUrl(config, `/api/v1/tasks/${task.id}`),
+            { headers: bailianVideoHeaders(config), signal: options?.signal },
+        );
+        const output = response.data.output;
+        if (!output) throw new Error(response.data.message || "百炼视频任务查询失败");
+        const status = (output.task_status || "").toUpperCase();
+        if (status === "SUCCEEDED") {
+            const url = output.video_url;
+            if (!url) return { status: "failed", error: "百炼视频任务成功但没有返回视频 URL" };
+            return { status: "completed", result: { url, mimeType: "video/mp4" } };
+        }
+        if (status === "FAILED" || status === "CANCELED" || status === "UNKNOWN") {
+            return { status: "failed", error: response.data.message || `百炼视频生成${status === "UNKNOWN" ? "任务不存在或已过期" : "失败"}` };
+        }
+        return { status: "pending" };
+    } catch (error) {
+        throw new Error(readAxiosError(error, "视频任务查询失败"));
+    }
 }
 
 async function createSeedanceTask(config: AiConfig, model: string, prompt: string, references: ReferenceImage[], videoReferences: ReferenceVideo[], audioReferences: ReferenceAudio[], options?: RequestOptions): Promise<VideoGenerationTask> {
@@ -318,7 +409,7 @@ function assertVideoConfig(config: AiConfig, model: string) {
     if (!model) throw new Error("请先配置视频模型");
     if (!config.baseUrl.trim()) throw new Error("请先配置 Base URL");
     if (!config.apiKey.trim()) throw new Error("请先配置 API Key");
-    if (config.apiFormat === "gemini") throw new Error("Gemini 调用格式暂不支持视频生成，请使用 OpenAI 或 NewAPI 格式渠道");
+    if (config.apiFormat === "gemini") throw new Error("Gemini 调用格式暂不支持视频生成，请使用 OpenAI、NewAPI 或百炼格式渠道");
 }
 
 function normalizeVideoSeconds(value: string) {

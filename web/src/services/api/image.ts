@@ -262,6 +262,104 @@ function geminiHeaders(config: Pick<AiConfig, "apiKey">) {
     };
 }
 
+type BailianImageResponse = {
+    output?: { choices?: Array<{ message?: { content?: Array<{ image?: string }> } }> };
+    code?: string;
+    message?: string;
+    request_id?: string;
+};
+
+function bailianApiUrl(config: Pick<AiConfig, "baseUrl">, path: string) {
+    return `${config.baseUrl.trim().replace(/\/+$/, "")}${path}`;
+}
+
+function bailianHeaders(config: Pick<AiConfig, "apiKey">) {
+    return {
+        Authorization: `Bearer ${config.apiKey}`,
+        "Content-Type": "application/json",
+    };
+}
+
+function bailianSizeValue(quality: string | undefined, size: string) {
+    const requestSize = resolveRequestSize(quality, size);
+    return requestSize ? requestSize.replace("x", "*") : undefined;
+}
+
+function blobToDataUrl(blob: Blob): Promise<string> {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result || ""));
+        reader.onerror = () => reject(new Error("读取图片失败"));
+        reader.readAsDataURL(blob);
+    });
+}
+
+async function fetchImageAsDataUrl(url: string, options?: RequestOptions): Promise<string> {
+    if (url.startsWith("data:")) return url;
+    const blob = await (await fetch(url, { signal: options?.signal })).blob();
+    return blobToDataUrl(blob);
+}
+
+async function parseBailianImageResponse(payload: BailianImageResponse, options?: RequestOptions) {
+    if (payload.code && payload.code !== "") throw new Error(payload.message || "请求失败");
+    const urls = (payload.output?.choices || [])
+        .flatMap((choice) => choice.message?.content || [])
+        .map((item) => item.image)
+        .filter((url): url is string => Boolean(url));
+    if (!urls.length) throw new Error("百炼接口没有返回图片");
+    const dataUrls = await Promise.all(urls.map((url) => fetchImageAsDataUrl(url, options)));
+    return dataUrls.map((dataUrl) => ({ id: nanoid(), dataUrl }));
+}
+
+async function requestBailianImages(config: AiConfig, prompt: string, count: number, options?: RequestOptions) {
+    const size = bailianSizeValue(normalizeQuality(config.quality), config.size);
+    const parameters: Record<string, unknown> = { n: count, prompt_extend: true, watermark: false };
+    if (size) parameters.size = size;
+    const body = {
+        model: config.model,
+        input: { messages: [{ role: "user", content: [{ text: withSystemPrompt(config, prompt) }] }] },
+        parameters,
+    };
+    try {
+        const response = await axios.post<BailianImageResponse>(
+            bailianApiUrl(config, "/api/v1/services/aigc/multimodal-generation/generation"),
+            body,
+            { headers: bailianHeaders(config), signal: options?.signal },
+        );
+        return await parseBailianImageResponse(response.data, options);
+    } catch (error) {
+        throw new Error(readAxiosError(error, "请求失败"));
+    }
+}
+
+async function requestBailianEdit(config: AiConfig, prompt: string, references: ReferenceImage[], count: number, options?: RequestOptions) {
+    if (!references.length) throw new Error("百炼图生图需要至少一张参考图");
+    const size = bailianSizeValue(normalizeQuality(config.quality), config.size);
+    const content: Array<Record<string, string>> = [];
+    for (const image of references.slice(0, 3)) {
+        const dataUrl = await imageToDataUrl(image);
+        if (dataUrl) content.push({ image: dataUrl });
+    }
+    content.push({ text: withSystemPrompt(config, prompt) });
+    const parameters: Record<string, unknown> = { n: count, prompt_extend: true, watermark: false };
+    if (size) parameters.size = size;
+    const body = {
+        model: config.model,
+        input: { messages: [{ role: "user", content }] },
+        parameters,
+    };
+    try {
+        const response = await axios.post<BailianImageResponse>(
+            bailianApiUrl(config, "/api/v1/services/aigc/multimodal-generation/generation"),
+            body,
+            { headers: bailianHeaders(config), signal: options?.signal },
+        );
+        return await parseBailianImageResponse(response.data, options);
+    } catch (error) {
+        throw new Error(readAxiosError(error, "请求失败"));
+    }
+}
+
 function withSystemMessage<T extends ResponseInputMessage>(config: AiConfig, messages: T[]): ResponseInputMessage[] {
     const systemPrompt = config.systemPrompt.trim();
     return systemPrompt ? [{ role: "system" as const, content: systemPrompt }, ...messages] : messages;
@@ -619,6 +717,9 @@ export async function requestGeneration(config: AiConfig, prompt: string, option
             throw new Error(readAxiosError(error, "请求失败"));
         }
     }
+    if (requestConfig.apiFormat === "bailian") {
+        return await requestBailianImages(requestConfig, prompt, n, options);
+    }
     const quality = normalizeQuality(config.quality);
     const requestSize = resolveRequestSize(quality, config.size);
     try {
@@ -657,6 +758,10 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
             throw new Error(readAxiosError(error, "请求失败"));
         }
     }
+    if (requestConfig.apiFormat === "bailian") {
+        if (mask) throw new Error("百炼调用格式暂不支持蒙版编辑");
+        return await requestBailianEdit(requestConfig, requestPrompt, references, n, options);
+    }
     const quality = normalizeQuality(config.quality);
     const requestSize = resolveRequestSize(quality, config.size);
     const formData = new FormData();
@@ -687,6 +792,7 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
 export async function requestImageQuestion(config: AiConfig, messages: AiTextMessage[], onDelta: (text: string) => void, options?: RequestOptions) {
     const requestConfig = resolveModelRequestConfig(config, config.model || config.textModel);
     try {
+        if (requestConfig.apiFormat === "bailian") throw new Error("百炼调用格式暂不支持文本问答，请使用 OpenAI 格式渠道");
         if (requestConfig.apiFormat === "gemini") {
             const answer = (await requestGeminiStreamingResponse(requestConfig, toGeminiBody(requestConfig, messages), onDelta, options)).content || "没有返回内容";
             if (answer === "没有返回内容") onDelta(answer);
@@ -706,6 +812,7 @@ export async function requestImageQuestion(config: AiConfig, messages: AiTextMes
 export async function requestToolResponse(config: AiConfig, messages: ResponseInputMessage[], tools: ResponseFunctionTool[], toolChoice: ToolChoice = "auto", onDelta?: (text: string) => void, options?: RequestOptions): Promise<ToolResponseResult> {
     const requestConfig = resolveModelRequestConfig(config, config.model || config.textModel);
     try {
+        if (requestConfig.apiFormat === "bailian") throw new Error("百炼调用格式暂不支持 Agent 工具调用，请使用 OpenAI 格式渠道");
         if (requestConfig.apiFormat === "gemini") {
             return await requestGeminiStreamingResponse(requestConfig, toGeminiBody(requestConfig, messages, toGeminiToolOptions(tools, toolChoice)), onDelta, options);
         }
@@ -723,6 +830,7 @@ export async function requestToolResponse(config: AiConfig, messages: ResponseIn
 
 export async function fetchImageModels(config: Pick<AiConfig, "baseUrl" | "apiKey" | "apiFormat">) {
     try {
+        if (config.apiFormat === "bailian") throw new Error("百炼暂不支持拉取模型列表，请手动填写模型名");
         if (config.apiFormat === "gemini") {
             const response = await axios.get<GeminiPayload>(geminiApiUrl({ ...defaultGeminiConfig, ...config }), { headers: geminiHeaders({ ...defaultGeminiConfig, ...config }) });
             validateGeminiPayload(response.data);

@@ -69,7 +69,8 @@ OpenAI 兼容图像和文本能力继续复用现有接口：
 视频能力根据渠道“调用格式”走不同接口：
 
 - OpenAI 格式：`POST /v1/videos`、`GET /v1/videos/{id}`、`GET /v1/videos/{id}/content`，图生视频以 `input_reference[]` 上传多张参考图。
-- NewAPI 格式：仅在视频接口上与 OpenAI 不同，创建任务为 `POST /v1/video/generations`（文生视频传 `prompt`，图生视频以 `image` 字段传单张图片 URL 或 Base64，可用 `duration`/`width`/`height` 控制输出），查询任务为 `GET /v1/video/generations/{task_id}`，成功后响应直接返回 `url` 视频地址，无需单独下载接口。其余生图、文本、音频、模型列表等能力与 OpenAI 格式完全一致。
+- NewAPI 格式：仅在视频接口上与 OpenAI 不同，创建任务为 `POST /v1/video/generations`（文生视频传 `prompt`，图生视频以 `images` 数组传参考图，可用 `duration`/`width`/`height` 控制输出），查询任务为 `GET /v1/video/generations/{task_id}`，成功后响应直接返回 `url` 视频地址，无需单独下载接口。其余生图、文本、音频、模型列表等能力与 OpenAI 格式完全一致。
+- 百炼格式（阿里云 DashScope）：默认 Base URL `https://dashscope.aliyuncs.com`，鉴权 `Authorization: Bearer`。生图为同步接口 `POST /api/v1/services/aigc/multimodal-generation/generation`，文生图传 `input.messages.content.text`、图生图/编辑在 content 里加 1-3 个 `image` 项（支持 base64 data URL），响应从 `output.choices[].message.content[].image` 取图片 URL。生视频为异步接口 `POST /api/v1/services/aigc/video-generation/video-synthesis`（带 `X-DashScope-Async: enable`），图生视频以 `input.media` 的 `first_frame` 传图（支持 base64），创建返回 `output.task_id`，轮询 `GET /api/v1/tasks/{task_id}`，`output.task_status` 为 `SUCCEEDED` 时取 `output.video_url`。百炼格式暂不支持文本问答、音频生成和拉取模型列表。百炼视频轮询的 `/api/v1/tasks/` 端点不返回 CORS 头，浏览器直连会被跨域拦截，需把渠道 Base URL 指向反代 dashscope 的地址（开发态用 `web/vite.config.ts` 的 `/bailian` 代理，生产 Docker 部署用 `nginx.conf` 内置的 `/bailian/` 反代 location）。
 - 火山方舟 Agent Plan / Seedance 2.0：Base URL 使用 `https://ark.cn-beijing.volces.com/api/plan/v3`，创建任务为 `POST /contents/generations/tasks`，查询任务为 `GET /contents/generations/tasks/{id}`，成功结果读取 `content.video_url`。
 
 Base URL 如果已经以 `/v1`、`/api/v3` 或 `/api/plan/v3` 结尾，系统不会再追加 `/v1`。因此 cpa 反代或火山方舟 Agent Plan 可以继续通过现有 Base URL + API Key + Model 方式配置，不需要新增火山生图 Provider。
