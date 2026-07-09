@@ -1,0 +1,7 @@
+# 仅打包本地已构建好的 web/dist，跳过 Docker 内 bun install（适用于本机已 npm run build 的场景）。
+FROM nginx:1.27-alpine
+
+COPY web/dist /usr/share/nginx/html
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+
+EXPOSE 3000
